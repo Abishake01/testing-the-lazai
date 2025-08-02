@@ -16,7 +16,7 @@ const resolveDispute = async (req, res) => {
     logger.info('Dispute resolution request received', {
       txHash,
       contractAddress,
-      toAddress,
+      toAddress: toAddress || 'not provided',
       disputeDescriptionLength: disputeDescription.length
     });
 
@@ -39,7 +39,7 @@ const resolveDispute = async (req, res) => {
     // Step 3: Get contract state (balances, ownership)
     const contractState = await blockchainService.getContractState(
       contractAddress, 
-      toAddress, 
+      toAddress || null, 
       parsedLogs
     );
 
@@ -51,18 +51,20 @@ const resolveDispute = async (req, res) => {
       parsedLogs.transfers.push(...historicalParsedLogs.transfers);
     }
 
-    // Step 5: Determine transaction status
+    // Step 5: Determine transaction status and analyze patterns
     const transactionStatus = receipt.status === 1 ? 'success' : 'failed';
+    const patternAnalysis = blockchainService.analyzeTransactionPattern(transaction, receipt, parsedLogs);
 
     // Step 6: Prepare data for AI analysis
     const disputeData = {
       txHash,
       contractAddress,
-      toAddress,
+      toAddress: toAddress || null,
       disputeDescription,
       parsedLogs,
       contractState,
       transactionStatus,
+      patternAnalysis,
       transactionDetails: {
         blockNumber: receipt.blockNumber,
         gasUsed: receipt.gasUsed?.toString(),
@@ -74,7 +76,7 @@ const resolveDispute = async (req, res) => {
     };
 
     // Step 7: Get AI resolution
-    const aiSolution = await aiService.resolveDispute(disputeData);
+    const aiSolution = await aiService.resolveDispute(disputeData);``
 
     // Step 8: Prepare response
     const response = {
@@ -82,7 +84,7 @@ const resolveDispute = async (req, res) => {
       data: {
         txHash,
         contractAddress,
-        toAddress,
+        toAddress: toAddress || null,
         transactionStatus,
         aiSolution,
         parsedLogs,
@@ -96,7 +98,7 @@ const resolveDispute = async (req, res) => {
       const dispute = new Dispute({
         txHash,
         contractAddress,
-        toAddress,
+        toAddress: toAddress || null,
         disputeDescription,
         aiSolution,
         parsedLogs,
@@ -111,7 +113,7 @@ const resolveDispute = async (req, res) => {
     }
 
     // Step 10: Cache results
-    const cacheKey = `dispute:${txHash}:${contractAddress}:${toAddress}`;
+    const cacheKey = `dispute:${txHash}:${contractAddress}:${toAddress || 'null'}`;
     await blockchainService.cacheData(cacheKey, response.data, 3600); // Cache for 1 hour
 
     const processingTime = Date.now() - startTime;
@@ -312,8 +314,9 @@ async function getTransactionLogs(req, res) {
           transfers: parsedLogs.transfers || [],
           failures: parsedLogs.failures || [],
           partialTransfers: parsedLogs.partialTransfers || [],
+          unknownEvents: parsedLogs.unknownEvents || [],
           totalLogs: receipt.logs ? receipt.logs.length : 0,
-          contractLogs: (parsedLogs.transfers?.length || 0) + (parsedLogs.failures?.length || 0) + (parsedLogs.partialTransfers?.length || 0)
+          contractLogs: (parsedLogs.transfers?.length || 0) + (parsedLogs.failures?.length || 0) + (parsedLogs.partialTransfers?.length || 0) + (parsedLogs.unknownEvents?.length || 0)
         },
         contractState: contractState || {},
         rawLogs: receipt.logs ? receipt.logs.map(log => ({

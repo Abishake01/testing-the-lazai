@@ -28,12 +28,11 @@ const validateDisputeRequest = [
       return true;
     }),
 
-  // Validate toAddress
+  // Validate toAddress (optional)
   body('toAddress')
-    .notEmpty()
-    .withMessage('Recipient address is required')
+    .optional()
     .custom((value) => {
-      if (!isValidAddress(value)) {
+      if (value && !isValidAddress(value)) {
         throw new Error('Invalid recipient address format');
       }
       return true;

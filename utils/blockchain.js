@@ -1,6 +1,7 @@
 const { ethers } = require('ethers');
 const logger = require('../config/logger');
 const { getRedisClient } = require('../config/database');
+const abiFetcher = require('./abiFetcher');
 
 // Standard ERC-20 and ERC-721 ABIs
 const ERC20_ABI = [
@@ -113,7 +114,8 @@ class BlockchainService {
       failures: [],
       partialTransfers: [],
       contractType: null,
-      contractInfo: {}
+      contractInfo: {},
+      unknownEvents: []
     };
 
     try {
@@ -123,6 +125,8 @@ class BlockchainService {
       const dummyContract = new ethers.Contract(contractAddress, DUMMY_DISPUTE_CONTRACT_ABI, this.provider);
 
       for (const log of logs) {
+        let parsed = false;
+        
         try {
           // Try to parse as ERC-20 Transfer
           const erc20Interface = new ethers.Interface(ERC20_ABI);
@@ -137,6 +141,7 @@ class BlockchainService {
               logIndex: log.logIndex
             });
             parsedLogs.contractType = 'ERC20';
+            parsed = true;
           }
         } catch (error) {
           try {
@@ -153,6 +158,7 @@ class BlockchainService {
                 logIndex: log.logIndex
               });
               parsedLogs.contractType = 'ERC721';
+              parsed = true;
             }
           } catch (erc721Error) {
             try {
@@ -171,6 +177,7 @@ class BlockchainService {
                       logIndex: log.logIndex
                     });
                     parsedLogs.contractType = 'MonadDummyContract';
+                    parsed = true;
                     break;
                   case 'TransferFailed':
                     parsedLogs.failures.push({
@@ -182,6 +189,7 @@ class BlockchainService {
                       logIndex: log.logIndex
                     });
                     parsedLogs.contractType = 'MonadDummyContract';
+                    parsed = true;
                     break;
                   case 'PartialTransfer':
                     parsedLogs.partialTransfers.push({
@@ -193,6 +201,7 @@ class BlockchainService {
                       logIndex: log.logIndex
                     });
                     parsedLogs.contractType = 'MonadDummyContract';
+                    parsed = true;
                     break;
                   case 'TokenMinted':
                     parsedLogs.transfers.push({
@@ -202,6 +211,7 @@ class BlockchainService {
                       logIndex: log.logIndex
                     });
                     parsedLogs.contractType = 'MonadDummyContract';
+                    parsed = true;
                     break;
                   case 'TokenTransferFailed':
                     parsedLogs.failures.push({
@@ -213,13 +223,99 @@ class BlockchainService {
                       logIndex: log.logIndex
                     });
                     parsedLogs.contractType = 'MonadDummyContract';
+                    parsed = true;
                     break;
                 }
               }
             } catch (dummyError) {
-              // Log is not a recognized event
-              continue;
+              // Continue to unknown event handling
             }
+          }
+        }
+        
+        // If we couldn't parse the log with known ABIs, add it as unknown event
+        if (!parsed && log.topics && log.topics.length > 0) {
+          // Extract comprehensive information from raw log
+          const eventSignature = log.topics[0];
+          
+          // Extract indexed parameters (topics)
+          const indexedParams = [];
+          for (let i = 1; i < log.topics.length; i++) {
+            const topic = log.topics[i];
+            // Try to decode as address (remove padding)
+            if (topic.length === 66) { // 32 bytes + 0x
+              try {
+                const address = ethers.getAddress('0x' + topic.slice(26));
+                indexedParams.push({ type: 'address', value: address });
+              } catch (error) {
+                indexedParams.push({ type: 'bytes32', value: topic });
+              }
+            } else {
+              indexedParams.push({ type: 'bytes32', value: topic });
+            }
+          }
+          
+          // Decode non-indexed parameters (data)
+          let nonIndexedParams = [];
+          if (log.data && log.data !== '0x') {
+            try {
+              // Try to decode as multiple uint256 values
+              const dataBytes = log.data.slice(2);
+              const chunkSize = 64; // 32 bytes = 64 hex chars
+              
+              for (let i = 0; i < dataBytes.length; i += chunkSize) {
+                const chunk = dataBytes.slice(i, i + chunkSize);
+                if (chunk.length === chunkSize) {
+                  try {
+                    const value = BigInt('0x' + chunk).toString();
+                    nonIndexedParams.push({ type: 'uint256', value: value });
+                  } catch (error) {
+                    nonIndexedParams.push({ type: 'bytes', value: '0x' + chunk });
+                  }
+                }
+              }
+            } catch (error) {
+              nonIndexedParams.push({ type: 'bytes', value: log.data });
+            }
+          }
+          
+          // Try to identify common event patterns
+          let eventType = 'Unknown';
+          let amount = null;
+          let from = null;
+          let to = null;
+          
+          // Look for transfer-like patterns
+          if (indexedParams.length >= 2 && indexedParams[0].type === 'address' && indexedParams[1].type === 'address') {
+            from = indexedParams[0].value;
+            to = indexedParams[1].value;
+            eventType = 'Transfer';
+            
+            // Look for amount in non-indexed params
+            if (nonIndexedParams.length > 0 && nonIndexedParams[0].type === 'uint256') {
+              amount = nonIndexedParams[0].value;
+            }
+          } else if (indexedParams.length >= 1 && indexedParams[0].type === 'address') {
+            // Single address parameter
+            from = indexedParams[0].value;
+            eventType = 'SingleAddress';
+          }
+          
+          parsedLogs.unknownEvents.push({
+            type: eventType,
+            eventSignature: eventSignature,
+            from: from,
+            to: to,
+            amount: amount,
+            indexedParams: indexedParams,
+            nonIndexedParams: nonIndexedParams,
+            logIndex: log.logIndex,
+            rawData: log.data
+          });
+          
+          // Set contract type to unknown if we haven't determined it yet
+          if (!parsedLogs.contractType) {
+            parsedLogs.contractType = 'Unknown';
           }
         }
       }
@@ -253,12 +349,14 @@ class BlockchainService {
           logger.warn('Could not fetch ERC-20 contract info:', error.message);
         }
 
-        // Get balance for toAddress
-        try {
-          const balance = await contract.balanceOf(toAddress);
-          state.balances[toAddress] = balance.toString();
-        } catch (error) {
-          logger.error('Failed to get ERC-20 balance:', error.message);
+        // Get balance for toAddress (if provided)
+        if (toAddress) {
+          try {
+            const balance = await contract.balanceOf(toAddress);
+            state.balances[toAddress] = balance.toString();
+          } catch (error) {
+            logger.error('Failed to get ERC-20 balance:', error.message);
+          }
         }
       } else if (parsedLogs.contractType === 'ERC721') {
         const contract = new ethers.Contract(contractAddress, ERC721_ABI, this.provider);
@@ -283,12 +381,14 @@ class BlockchainService {
           }
         }
 
-        // Get balance for toAddress
-        try {
-          const balance = await contract.balanceOf(toAddress);
-          state.balances[toAddress] = balance.toString();
-        } catch (error) {
-          logger.error('Failed to get ERC-721 balance:', error.message);
+        // Get balance for toAddress (if provided)
+        if (toAddress) {
+          try {
+            const balance = await contract.balanceOf(toAddress);
+            state.balances[toAddress] = balance.toString();
+          } catch (error) {
+            logger.error('Failed to get ERC-721 balance:', error.message);
+          }
         }
       } else if (parsedLogs.contractType === 'MonadDummyContract') {
         const contract = new ethers.Contract(contractAddress, DUMMY_DISPUTE_CONTRACT_ABI, this.provider);
@@ -301,12 +401,14 @@ class BlockchainService {
           logger.warn('Could not fetch Monad contract info:', error.message);
         }
 
-        // Get balance for toAddress
-        try {
-          const balance = await contract.balanceOf(toAddress);
-          state.balances[toAddress] = balance.toString();
-        } catch (error) {
-          logger.error('Failed to get Monad contract balance:', error.message);
+        // Get balance for toAddress (if provided)
+        if (toAddress) {
+          try {
+            const balance = await contract.balanceOf(toAddress);
+            state.balances[toAddress] = balance.toString();
+          } catch (error) {
+            logger.error('Failed to get Monad contract balance:', error.message);
+          }
         }
 
         // Get ownership for each token ID in transfers
@@ -376,6 +478,59 @@ class BlockchainService {
       logger.error('Redis get error:', error.message);
       return null;
     }
+  }
+
+  /**
+   * Analyze transaction patterns without ABI
+   */
+  analyzeTransactionPattern(transaction, receipt, parsedLogs) {
+    const analysis = {
+      transactionType: 'unknown',
+      valueTransferred: '0',
+      eventsEmitted: 0,
+      contractInteraction: false,
+      success: receipt.status === 1,
+      gasUsed: receipt.gasUsed?.toString() || '0',
+      patterns: []
+    };
+
+    // Check if this is a contract interaction
+    if (transaction.to && transaction.data && transaction.data !== '0x') {
+      analysis.contractInteraction = true;
+    }
+
+    // Analyze value transfer
+    if (transaction.value && transaction.value > 0) {
+      analysis.valueTransferred = transaction.value.toString();
+      analysis.patterns.push('ETH_TRANSFER');
+    }
+
+    // Analyze events
+    if (parsedLogs.unknownEvents && parsedLogs.unknownEvents.length > 0) {
+      analysis.eventsEmitted = parsedLogs.unknownEvents.length;
+      
+      for (const event of parsedLogs.unknownEvents) {
+        if (event.type === 'Transfer' && event.amount) {
+          analysis.patterns.push('TOKEN_TRANSFER');
+          analysis.valueTransferred = event.amount;
+        } else if (event.type === 'SingleAddress') {
+          analysis.patterns.push('SINGLE_ADDRESS_EVENT');
+        }
+      }
+    }
+
+    // Determine transaction type based on patterns
+    if (analysis.patterns.includes('ETH_TRANSFER') && analysis.contractInteraction) {
+      analysis.transactionType = 'contract_eth_transfer';
+    } else if (analysis.patterns.includes('TOKEN_TRANSFER')) {
+      analysis.transactionType = 'token_transfer';
+    } else if (analysis.contractInteraction) {
+      analysis.transactionType = 'contract_call';
+    } else if (analysis.patterns.includes('ETH_TRANSFER')) {
+      analysis.transactionType = 'eth_transfer';
+    }
+
+    return analysis;
   }
 }
 
