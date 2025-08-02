@@ -34,7 +34,7 @@ const resolveDispute = async (req, res) => {
     }
 
     // Step 2: Parse logs and determine contract type
-    const parsedLogs = blockchainService.parseLogs(receipt.logs, contractAddress);
+    const parsedLogs = await blockchainService.parseLogs(receipt.logs, contractAddress);
     
     // Step 3: Get contract state (balances, ownership)
     const contractState = await blockchainService.getContractState(
@@ -47,7 +47,7 @@ const resolveDispute = async (req, res) => {
     let historicalLogs = [];
     if (parsedLogs.transfers.length === 0) {
       historicalLogs = await blockchainService.getHistoricalLogs(contractAddress);
-      const historicalParsedLogs = blockchainService.parseLogs(historicalLogs, contractAddress);
+      const historicalParsedLogs = await blockchainService.parseLogs(historicalLogs, contractAddress);
       parsedLogs.transfers.push(...historicalParsedLogs.transfers);
     }
 
@@ -291,7 +291,7 @@ async function getTransactionLogs(req, res) {
     const transaction = await blockchainService.getTransaction(txHash);
     
     // Parse logs for the specific contract
-    const parsedLogs = blockchainService.parseLogs(receipt.logs || [], contractAddress);
+    const parsedLogs = await blockchainService.parseLogs(receipt.logs || [], contractAddress);
     
     // Get contract state
     const contractState = await blockchainService.getContractState(contractAddress, null, parsedLogs);

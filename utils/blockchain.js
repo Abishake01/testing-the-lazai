@@ -108,17 +108,38 @@ class BlockchainService {
   /**
    * Parse logs for ERC-20, ERC-721, and Monad DummyDisputeContract transfers
    */
-  parseLogs(logs, contractAddress) {
+  async parseLogs(logs, contractAddress) {
     const parsedLogs = {
       transfers: [],
       failures: [],
       partialTransfers: [],
       contractType: null,
       contractInfo: {},
-      unknownEvents: []
+      unknownEvents: [],
+      parsedEvents: []
     };
 
     try {
+      // First try to fetch and use the actual contract ABI
+      const contractABI = await abiFetcher.fetchABI(contractAddress);
+      
+      if (contractABI) {
+        logger.info(`Using fetched ABI for ${contractAddress}`);
+        const abiParsedLogs = abiFetcher.parseLogsWithABI(logs, contractAddress, contractABI);
+        
+        // Merge the results
+        parsedLogs.transfers = abiParsedLogs.transfers;
+        parsedLogs.failures = abiParsedLogs.failures;
+        parsedLogs.partialTransfers = abiParsedLogs.partialTransfers;
+        parsedLogs.parsedEvents = abiParsedLogs.parsedEvents;
+        parsedLogs.contractType = abiParsedLogs.contractType;
+        
+        return parsedLogs;
+      }
+
+      // Fallback to known ABIs if no contract ABI found
+      logger.info(`No ABI found for ${contractAddress}, using fallback parsing`);
+      
       // Try to determine contract type and parse logs
       const erc20Contract = new ethers.Contract(contractAddress, ERC20_ABI, this.provider);
       const erc721Contract = new ethers.Contract(contractAddress, ERC721_ABI, this.provider);
